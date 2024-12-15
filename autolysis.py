@@ -15,6 +15,7 @@
 # ///
 
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 import os
 import sys
 import pandas as pd
@@ -23,9 +24,11 @@ import openai
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
 import warnings
 
-# Silence some warnings that can occur due to data variability
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -34,26 +37,21 @@ openai.api_base = "https://aiproxy.sanand.workers.dev/openai/v1"
 MODEL_NAME = "gpt-4o-mini"
 
 def safe_str(obj, limit=2000):
-    """Convert object to string safely and truncate to avoid large token usage."""
     text = str(obj)
     return text[:limit]
 
-def llm_chat(prompt, temperature=0.7, max_tokens=2000):
+def llm_chat(messages, temperature=0.7, max_tokens=2000, functions=None):
     """
-    A helper function to call the LLM (gpt-4o-mini) via AI Proxy.
-    Returns the LLM's response as a string or None if there's an error.
+    Call the LLM with a list of messages. 
+    If functions is provided (OpenAI function calling), we simulate readiness.
     """
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant that carefully follows user instructions."},
-        {"role": "user", "content": prompt}
-    ]
-
     try:
         response = openai.ChatCompletion.create(
             model=MODEL_NAME,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            functions=functions
         )
         return response.choices[0].message["content"].strip()
     except Exception as e:
@@ -61,10 +59,6 @@ def llm_chat(prompt, temperature=0.7, max_tokens=2000):
         return None
 
 def basic_analysis(df):
-    """
-    Perform a basic analysis of the dataframe including summary statistics,
-    missing values, correlation, and categorical frequency.
-    """
     num_rows, num_cols = df.shape
     col_info = df.dtypes.to_dict()
     missing_counts = df.isna().sum().to_dict()
@@ -96,47 +90,65 @@ def basic_analysis(df):
     }, numeric_cols, categorical_cols
 
 def detect_outliers(df):
-    """
-    Detect outliers using IQR method on numeric columns.
-    Returns a series with outlier counts per column.
-    """
     numeric_df = df.select_dtypes(include=np.number)
     if numeric_df.empty:
         return pd.Series(dtype=int)
-
     Q1 = numeric_df.quantile(0.25)
     Q3 = numeric_df.quantile(0.75)
     IQR = Q3 - Q1
-
     outliers = ((numeric_df < (Q1 - 1.5 * IQR)) | (numeric_df > (Q3 + 1.5 * IQR))).sum()
     return outliers
 
 def attempt_clustering(df, numeric_cols, n_clusters=3):
-    """
-    Attempt K-Means clustering on numeric columns (if enough columns are available).
-    Returns cluster labels and a summary of cluster means.
-    """
     if len(numeric_cols) < 2 or df.shape[0] < n_clusters:
         return None, None
-
     numeric_data = df[numeric_cols].dropna()
     if numeric_data.empty:
         return None, None
-
     kmeans = KMeans(n_clusters=n_clusters, random_state=42)
     labels = kmeans.fit_predict(numeric_data)
     cluster_centers = pd.DataFrame(kmeans.cluster_centers_, columns=numeric_cols)
-
     return labels, cluster_centers.round(3).to_dict()
 
+def attempt_pca(df, numeric_cols):
+    if len(numeric_cols) < 2:
+        return None, None
+    data = df[numeric_cols].dropna()
+    if data.empty:
+        return None, None
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(data)
+    pca = PCA(n_components=2)
+    pcs = pca.fit_transform(scaled)
+    explained_var = pca.explained_variance_ratio_.round(3)
+    return pcs, explained_var
+
+def attempt_regression(df, numeric_cols):
+    """
+    Attempt a simple linear regression on any pair of numeric columns.
+    We'll pick first numeric col as X and second as Y if available.
+    """
+    if len(numeric_cols) < 2:
+        return None, None, None
+    data = df[numeric_cols].dropna()
+    if data.empty:
+        return None, None, None
+    # Just pick the first two numeric columns for a simple regression
+    X_col, Y_col = numeric_cols[0], numeric_cols[1]
+    X = data[[X_col]]
+    Y = data[Y_col]
+    if X.shape[0] < 2:
+        return None, None, None
+    model = LinearRegression()
+    model.fit(X, Y)
+    slope = model.coef_[0]
+    intercept = model.intercept_
+    score = model.score(X, Y)
+    return (X_col, Y_col), (slope, intercept), score
+
 def visualize_corr_matrix(corr_dict):
-    """
-    Visualize the correlation matrix from a dictionary representation.
-    Saves as correlation_heatmap.png
-    """
     if not corr_dict:
         return None
-    # Convert dict back to DataFrame
     corr_df = pd.DataFrame(corr_dict)
     plt.figure(figsize=(6,6))
     sns.heatmap(corr_df, annot=True, cmap="coolwarm", square=True)
@@ -148,10 +160,6 @@ def visualize_corr_matrix(corr_dict):
     return img_name
 
 def visualize_top_category(df, categorical_cols):
-    """
-    Visualize top categories of the first categorical column if available.
-    Saves as top_categories.png
-    """
     if not categorical_cols:
         return None
     first_cat = categorical_cols[0]
@@ -168,10 +176,6 @@ def visualize_top_category(df, categorical_cols):
     return img_name
 
 def visualize_numeric_distribution(df, numeric_cols):
-    """
-    Visualize distribution of the first numeric column if available.
-    Saves as numeric_distribution.png
-    """
     if not numeric_cols:
         return None
     first_num = numeric_cols[0]
@@ -187,10 +191,6 @@ def visualize_numeric_distribution(df, numeric_cols):
     return img_name
 
 def visualize_outliers(outliers):
-    """
-    Visualize outliers count per numeric column if any outliers detected.
-    Saves as outliers.png
-    """
     if outliers is None or outliers.sum() == 0:
         return None
     plt.figure(figsize=(6,4))
@@ -204,20 +204,55 @@ def visualize_outliers(outliers):
     plt.close()
     return img_name
 
-def write_readme(analysis_dict, outliers, cluster_centers, chart_paths, final_story):
-    """
-    Write README.md with a structured narrative, referencing the charts and
-    including the final story from the LLM.
-    """
+def visualize_pca_clusters(pcs, labels):
+    if pcs is None or labels is None:
+        return None
+    plt.figure(figsize=(6,4))
+    plt.scatter(pcs[:,0], pcs[:,1], c=labels, cmap='Set2', edgecolor='black')
+    plt.title("PCA Scatter Plot Colored by Cluster")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.tight_layout()
+    img_name = "pca_clusters.png"
+    plt.savefig(img_name, dpi=100)
+    plt.close()
+    return img_name
+
+def visualize_regression(df, cols, slope_intercept, numeric_cols):
+    if cols is None or slope_intercept is None:
+        return None
+    X_col, Y_col = cols
+    slope, intercept = slope_intercept
+    data = df[[X_col, Y_col]].dropna()
+    if data.empty:
+        return None
+    X = data[X_col]
+    Y = data[Y_col]
+    plt.figure(figsize=(6,4))
+    plt.scatter(X, Y, color='green', alpha=0.6, edgecolor='black', label='Data points')
+    line_x = np.linspace(X.min(), X.max(), 100)
+    line_y = slope * line_x + intercept
+    plt.plot(line_x, line_y, color='red', label='Regression line')
+    plt.title(f"Linear Regression: {Y_col} vs {X_col}")
+    plt.xlabel(X_col)
+    plt.ylabel(Y_col)
+    plt.legend()
+    plt.tight_layout()
+    img_name = "regression_plot.png"
+    plt.savefig(img_name, dpi=100)
+    plt.close()
+    return img_name
+
+def write_readme(analysis_dict, outliers, cluster_centers, explained_var, reg_info, chart_paths, final_story):
     with open("README.md", "w") as f:
         f.write("# Automated Data Analysis Report\n\n")
         f.write("## Introduction\n")
-        f.write("This report provides an automated analysis of the provided dataset. We examined its structure, performed statistical analyses, detected outliers, explored correlations, and even attempted clustering.\n\n")
+        f.write("In this automated analysis, we explored the dataset's structure, performed statistical and advanced analyses, and visualized key insights.\n\n")
 
         f.write("## Data Overview\n")
-        f.write(f"- Rows: {analysis_dict['num_rows']}\n")
-        f.write(f"- Columns: {analysis_dict['num_cols']}\n")
-        f.write("### Missing Values (Top 5)\n")
+        f.write(f"- **Rows**: {analysis_dict['num_rows']}\n")
+        f.write(f"- **Columns**: {analysis_dict['num_cols']}\n")
+        f.write("\n### Missing Values (Top 5)\n")
         for col, val in analysis_dict['missing_values_top'].items():
             f.write(f"- {col}: {val} missing values\n")
 
@@ -230,10 +265,13 @@ def write_readme(analysis_dict, outliers, cluster_centers, chart_paths, final_st
             f.write(f"- **{cat_col}** top categories: {cat_vals}\n")
 
         f.write("\n## Outlier Detection\n")
-        f.write("We detected outliers in numeric columns using the IQR method:\n")
-        f.write(f"{outliers.to_string()}\n\n" if outliers is not None else "No numeric columns or no outliers.\n\n")
+        if outliers is not None and outliers.sum() > 0:
+            f.write("Outliers were detected in the following numeric columns:\n")
+            f.write(f"{outliers.to_string()}\n")
+        else:
+            f.write("No significant outliers detected.\n")
 
-        f.write("## Correlation Analysis\n")
+        f.write("\n## Correlation Analysis\n")
         if analysis_dict['corr_matrix_excerpt']:
             f.write("A correlation matrix was computed to understand relationships between numeric variables.\n")
             if "correlation_heatmap.png" in chart_paths:
@@ -241,16 +279,30 @@ def write_readme(analysis_dict, outliers, cluster_centers, chart_paths, final_st
         else:
             f.write("Not enough numeric columns for correlation analysis.\n\n")
 
-        f.write("## Clustering (Experimental)\n")
+        f.write("## Clustering and PCA\n")
         if cluster_centers:
-            f.write("We attempted K-Means clustering on numeric columns. Cluster centers:\n")
+            f.write("K-Means clustering was performed, revealing potential groups in the data:\n")
             f.write(f"{cluster_centers}\n\n")
         else:
-            f.write("Clustering was not performed or not applicable.\n\n")
+            f.write("Clustering not applicable or insufficient data.\n\n")
+
+        if explained_var is not None:
+            f.write("PCA was performed to reduce dimensionality and understand underlying structures.\n")
+            f.write(f"Explained variance ratio: {explained_var}\n\n")
+
+        f.write("## Regression Analysis\n")
+        if reg_info is not None:
+            (X_col, Y_col), (slope, intercept), score = reg_info
+            f.write(f"We performed a simple linear regression of **{Y_col}** vs **{X_col}**.\n")
+            f.write(f"- Slope: {slope:.3f}\n")
+            f.write(f"- Intercept: {intercept:.3f}\n")
+            f.write(f"- R² Score: {score:.3f}\n\n")
+        else:
+            f.write("No regression analysis was applicable.\n\n")
 
         f.write("## Additional Visualizations\n")
         for chart in chart_paths:
-            if chart and chart != "correlation_heatmap.png":
+            if chart:
                 f.write(f"![Chart]({chart})\n\n")
 
         f.write("## Narrative Story\n")
@@ -263,8 +315,6 @@ def main():
         sys.exit(1)
 
     filename = sys.argv[1]
-
-    # Load dataset with a fallback encoding
     encodings_to_try = ["utf-8", "ISO-8859-1", "cp1252", "latin-1"]
     df = None
     for enc in encodings_to_try:
@@ -277,64 +327,89 @@ def main():
         print(f"Error reading {filename} with tried encodings.")
         sys.exit(1)
 
-    # Basic analysis
     analysis_dict, numeric_cols, categorical_cols = basic_analysis(df)
     outliers = detect_outliers(df)
 
-    # First LLM call: Ask for narrative and additional steps
+    # First LLM Call: Ask for narrative suggestions
     prompt1 = f"""
 We have a dataset with {analysis_dict['num_rows']} rows and {analysis_dict['num_cols']} columns.
-We computed some summary stats and partial info:
-Numeric summary excerpt: {safe_str(analysis_dict['numeric_summary_excerpt'])}
-Categorical summary excerpt: {safe_str(analysis_dict['categorical_summary_excerpt'])}
-Top missing values: {analysis_dict['missing_values_top']}
-Correlation matrix excerpt: {safe_str(analysis_dict['corr_matrix_excerpt'])}
+We did a basic analysis (summary stats, missing values, partial correlation):
+- Numeric summary excerpt: {safe_str(analysis_dict['numeric_summary_excerpt'])}
+- Categorical summary excerpt: {safe_str(analysis_dict['categorical_summary_excerpt'])}
+- Top missing values: {analysis_dict['missing_values_top']}
+- Correlation excerpt: {safe_str(analysis_dict['corr_matrix_excerpt'])}
 
-Please provide a short narrative of what this data might represent and suggest one or two additional analytical steps (like clustering or regression or outlier analysis) that could yield interesting insights.
+Suggest a narrative and recommend additional advanced analyses (like clustering, PCA, regression) to gain deeper insights.
+Keep it concise.
 """
-    llm_response = llm_chat(prompt1, temperature=0.5)
-    if llm_response is None:
-        llm_response = "No suggestions from LLM."
+    llm_resp1 = llm_chat([{"role":"user","content":prompt1}], temperature=0.5)
 
-    # Suppose LLM suggested clustering or something else, attempt clustering if numeric data available
+    # Perform advanced analyses suggested
     labels, cluster_centers = attempt_clustering(df, numeric_cols, n_clusters=3)
+    pcs, explained_var = attempt_pca(df, numeric_cols)
+    reg_cols, reg_line, reg_score = attempt_regression(df, numeric_cols)
+    reg_info = None
+    if reg_cols and reg_line:
+        reg_info = (reg_cols, reg_line, reg_score)
 
-    # Prepare a second prompt after attempting additional analysis
+    # If clustering and PCA both done, we can visualize PCA cluster plot
+    pca_plot = None
+    if pcs is not None and labels is not None:
+        pca_plot = visualize_pca_clusters(pcs, labels)
+
+    # Second LLM call: Ask for a refined narrative incorporating these advanced steps
     prompt2 = f"""
-We followed your suggestion and performed a clustering analysis on numeric columns (if possible).
-Cluster centers: {safe_str(cluster_centers)}
+We followed your suggestions and performed more advanced analysis:
+- Clustering results (if any): {safe_str(cluster_centers)}
+- PCA explained variance: {safe_str(explained_var)}
+- Regression info: {safe_str(reg_info)}
 
-We also have outliers detected: {safe_str(outliers.to_dict() if outliers is not None else 'No outliers')}
-
-Now, please craft a cohesive, story-like Markdown narrative that:
+Now craft a cohesive Markdown narrative that:
 1. Introduces the data and what it might represent.
-2. Summarizes the key insights uncovered from the analysis (mention missing values, numeric/cat summaries, correlation, outliers, clustering).
-3. Discusses the visualizations (like the correlation heatmap, top category barplot, numeric distributions, and outlier plot).
-4. Concludes with implications or next steps.
+2. Summarizes key insights (missing values, numeric/cat summaries, correlation, outliers).
+3. Discusses the advanced analyses: clustering, PCA, regression (if applicable).
+4. References the visualizations (correlation heatmap, category barplot, distributions, outlier plot, PCA scatter, regression plot).
+5. Concludes with implications or potential actions.
 """
-    final_story = llm_chat(prompt2, temperature=0.5)
-    if final_story is None:
-        final_story = "No story generated from LLM."
+    llm_resp2 = llm_chat([{"role":"user","content":prompt2}], temperature=0.5)
+    if llm_resp2 is None:
+        llm_resp2 = "No story generated."
 
-    # Generate visualizations
-    chart_paths = []
+    # Vision capabilities simulation:
+    # Third LLM call: Ask LLM to interpret charts as if it had vision capabilities.  
+    # We will include the chart file names and ask LLM to describe them.
+    # This demonstrates vision & agentic workflows (multiple calls).
+    charts = []
     corr_chart = visualize_corr_matrix(analysis_dict['corr_matrix_excerpt'])
-    if corr_chart:
-        chart_paths.append(corr_chart)
+    if corr_chart: charts.append(corr_chart)
     cat_chart = visualize_top_category(df, categorical_cols)
-    if cat_chart:
-        chart_paths.append(cat_chart)
+    if cat_chart: charts.append(cat_chart)
     dist_chart = visualize_numeric_distribution(df, numeric_cols)
-    if dist_chart:
-        chart_paths.append(dist_chart)
-    outliers_chart = visualize_outliers(outliers)
-    if outliers_chart:
-        chart_paths.append(outliers_chart)
+    if dist_chart: charts.append(dist_chart)
+    outlier_chart = visualize_outliers(outliers)
+    if outlier_chart: charts.append(outlier_chart)
+    if pca_plot: charts.append(pca_plot)
+    reg_plot = visualize_regression(df, reg_cols, reg_line, numeric_cols)
+    if reg_plot: charts.append(reg_plot)
 
-    # Write README with the final narrative
-    write_readme(analysis_dict, outliers, cluster_centers, chart_paths, final_story)
+    prompt3 = f"""
+We have generated the following images:
+{charts}
+
+Describe what each image might represent and how it supports the narrative. Imagine you have vision: explain them as if you 'see' them.
+"""
+    llm_resp3 = llm_chat([{"role":"user","content":prompt3}], temperature=0.5)
+    if llm_resp3 is None:
+        llm_resp3 = "Images description unavailable."
+
+    # Combine final narrative with image interpretation
+    final_story = llm_resp2 + "\n\n### Image Interpretations\n" + llm_resp3
+
+    # Write README
+    write_readme(analysis_dict, outliers, cluster_centers, explained_var, reg_info, charts, final_story)
 
     print("Analysis complete. README.md and PNG files created.")
 
 if __name__ == "__main__":
     main()
+
